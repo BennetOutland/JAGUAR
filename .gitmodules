@@ -1,0 +1,3 @@
+[submodule "DynamicPlanning.jl"]
+	path = DynamicPlanning.jl
+	url = https://github.com/JuliaDifferentialGames/DynamicPlanning.jl.git
