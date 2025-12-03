@@ -8,7 +8,7 @@ include("reachability.jl")
 
 
 x0 = [-3.0, -2.5, 0.0]
-T = 10.0
+T = 20.0
 
 
 # Define the workspace
@@ -16,7 +16,7 @@ T = 10.0
 
 # Define and add obstacles 
 𝒪 = create_pursuit_evasion_obstacles(𝒲)
-# add_obstacles!(𝒲, [𝒪[12], 𝒪[15]])
+# add_obstacles!(𝒲, [𝒪[12], 𝒪[14]])
 
 add_obstacles!(𝒲, 𝒪)
 
@@ -32,7 +32,7 @@ add_box_constraint!(R, [-10, -10, -pi/3], [10, 10, pi/3], :x)
 
 # 1. Compute offline reachable set
 # reach_set = compute_reachable_set(R, T; n_segments=10, n_samples=20)
-reach_set = compute_reachable_set(R, T; n_segments=10, n_samples=20)
+reach_set = compute_reachable_set(R, T; n_segments=50, n_samples=10)
 
 # 2. Precompute configuration space obstacles
 c_obstacles = precompute_c_space_obstacles(R, 𝒲)
@@ -41,8 +41,7 @@ c_obstacles = precompute_c_space_obstacles(R, 𝒲)
 current_reach = transform(reach_set, 0.0, [0.0, 0.0])
 
 # 4. Subtract obstacles to get safe region
-safe_reach = compute_safe_reachable_set(current_reach, c_obstacles, min_area=1e-6)
-#safe_reach = compute_safe_reachable_set(reach_set, c_obstacles)
+safe_reach = compute_safe_reachable_set(current_reach, c_obstacles, min_area=1e-10)
 
 
 # Summary
@@ -60,12 +59,16 @@ for (i, poly) in enumerate(c_obstacles)
           label=(i == 1 ? "Obstacles" : ""))
 end
 
+
+
 # Plot safe reachable set with unified color
 plot_reachable_set!(p1, safe_reach, 
                    color=:red, 
                    alpha=0.5,
                    use_raster=true,     # Pixel-perfect
-                   resolution=300)      # Adjust quality
+                   resolution=300, label="Reachable Set")      # Adjust quality
+
+scatter!(p1, [x0[1]], [x0[2]], label="Initial Condition", markershape = :star5, markersize = 7, color=:black)
 
 display(p1)
 

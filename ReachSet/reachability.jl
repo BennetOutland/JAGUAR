@@ -124,32 +124,3 @@ function compute_safe_reachable_set(reach_set::ReachableSet,
 end
 
 
-# """
-# Check if a point is in the reachable set
-
-# # Arguments
-# - `reach_set`: ReachableSet to query
-# - `point`: Query point [x, y]
-
-# # Returns
-# - `Bool`: True if point is reachable
-# """
-# function contains(reach_set::ReachableSet, point::Vector{Float64})
-#     return any(point ∈ poly for poly in reach_set.polytopes)
-# end
-
-# """
-# Get total area of reachable set
-# """
-# function area(reach_set::ReachableSet)
-#     if reach_set.is_unified
-#         # Polytopes are disjoint after union
-#         return sum(LazySets.area, reach_set.polytopes)
-#     else
-#         # May have overlaps - union first for accurate area
-#         unified = polygon_union(reach_set.polytopes)
-#         return sum(LazySets.area, unified)
-#     end
-# end
-
-
