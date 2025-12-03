@@ -1,21 +1,12 @@
 using DifferentialEquations, Plots, LazySets, LinearAlgebra
-using Clipper   
+# using Clipper   
 
 include("reach_utils.jl")
 include("../DynamicPlanning.jl/src/workspace.jl")
 include("../DynamicPlanning.jl/src/robot.jl")
 
-"""
-Represents a precomputed reachable set that can be transformed and intersected with obstacles
 
-# Fields
-- `polytopes`: Collection of convex polygons representing the reachable set
-- `is_unified`: Whether polytopes have been unioned (for efficiency)
-"""
-struct ReachableSet
-    polytopes::Vector{VPolygon}
-    is_unified::Bool
-end
+
 
 """
 Compute reachable set for robot over time horizon T
@@ -42,7 +33,7 @@ function compute_reachable_set(robot, T::Float64; n_segments::Int=8, n_samples::
     )
     @info "  → Generated $(length(polytopes)) convex polytopes"
     
-    return ReachableSet(polytopes, false)
+    return ReachableSet(polytopes, false, false)
 end
 
 """
@@ -54,12 +45,13 @@ Transform reachable set by rotation and translation
 - `displacement`: Translation vector [dx, dy]
 
 # Returns
-- `ReachableSet`: Transformed reachable set
+- `ReachableSet`: Transformed reachable set (preserves safety status)
 """
 function transform(reach_set::ReachableSet, θ::Float64, displacement::Vector{Float64})
     transformed = transform_polygons(reach_set.polytopes, θ, displacement)
-    return ReachableSet(transformed, reach_set.is_unified)
+    return ReachableSet(transformed, reach_set.is_unified, reach_set.is_safe)
 end
+
 
 """
 Precompute configuration space obstacles from workspace obstacles
@@ -91,51 +83,73 @@ end
 """
 Compute safe (obstacle-free) reachable set
 
+IMPORTANT: This preserves nonconvex geometry (holes, complex shapes) by keeping
+polytopes separate. Do NOT union the result unless you want convex over-approximation.
+
 # Arguments
 - `reach_set`: ReachableSet to filter
 - `c_space_obstacles`: Configuration space obstacles
-- `batch_size`: Tuning parameter for union frequency (default: 10)
+- `merge_adjacent`: If true, merge adjacent polytopes to reduce count (default: false)
+- `min_area`: Filter out polytopes smaller than this threshold (default: 1e-10)
 
 # Returns
-- `ReachableSet`: Safe reachable set with obstacles removed
+- `ReachableSet`: Safe reachable set with obstacles removed (nonconvex representation)
 """
 function compute_safe_reachable_set(reach_set::ReachableSet, 
                                    c_space_obstacles::Vector{VPolygon};
-                                   batch_size::Int=10)
+                                   merge_adjacent::Bool=false,
+                                   min_area::Float64=1e-10)
     
-    # safe_polytopes = subtract_obstacles(reach_set.polytopes, c_space_obstacles; 
-    #                                    batch_size=batch_size)
+    @info "Computing safe reachable set (merge_adjacent=$merge_adjacent)..."
+    
+    # Subtract obstacles using the nonconvex-preserving algorithm
     safe_polytopes = subtract_obstacles(reach_set.polytopes, c_space_obstacles)
     
-    return ReachableSet(safe_polytopes, true)  # Mark as unified after subtraction
-end
-
-"""
-Check if a point is in the reachable set
-
-# Arguments
-- `reach_set`: ReachableSet to query
-- `point`: Query point [x, y]
-
-# Returns
-- `Bool`: True if point is reachable
-"""
-function contains(reach_set::ReachableSet, point::Vector{Float64})
-    return any(point ∈ poly for poly in reach_set.polytopes)
-end
-
-"""
-Get total area of reachable set
-"""
-function area(reach_set::ReachableSet)
-    if reach_set.is_unified
-        # Polytopes are disjoint after union
-        return sum(LazySets.area, reach_set.polytopes)
-    else
-        # May have overlaps - union first for accurate area
-        unified = polygon_union(reach_set.polytopes)
-        return sum(LazySets.area, unified)
+    # Optional: merge adjacent fragments to reduce polytope count
+    # WARNING: This may still introduce some convex over-approximation
+    if merge_adjacent && !isempty(safe_polytopes)
+        @info "  Merging adjacent polytopes..."
+        safe_polytopes = polygon_union_geos(safe_polytopes)
     end
+    
+    # Filter out degenerate/tiny polytopes
+    safe_polytopes = filter(safe_polytopes) do poly
+        length(poly.vertices) >= 3 && LazySets.area(poly) > min_area
+    end
+    
+    @info "  → Result contains $(length(safe_polytopes)) polytopes"
+    
+    # Mark as safe (obstacles subtracted) but NOT unified (preserves nonconvexity)
+    return ReachableSet(safe_polytopes, merge_adjacent, true)
 end
+
+
+# """
+# Check if a point is in the reachable set
+
+# # Arguments
+# - `reach_set`: ReachableSet to query
+# - `point`: Query point [x, y]
+
+# # Returns
+# - `Bool`: True if point is reachable
+# """
+# function contains(reach_set::ReachableSet, point::Vector{Float64})
+#     return any(point ∈ poly for poly in reach_set.polytopes)
+# end
+
+# """
+# Get total area of reachable set
+# """
+# function area(reach_set::ReachableSet)
+#     if reach_set.is_unified
+#         # Polytopes are disjoint after union
+#         return sum(LazySets.area, reach_set.polytopes)
+#     else
+#         # May have overlaps - union first for accurate area
+#         unified = polygon_union(reach_set.polytopes)
+#         return sum(LazySets.area, unified)
+#     end
+# end
 
 

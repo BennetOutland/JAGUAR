@@ -1,168 +1,141 @@
 using DifferentialEquations, Plots, LazySets, LinearAlgebra
-using Clipper   
+# using Clipper   
 
 include("reach_utils.jl")
 include("../DynamicPlanning.jl/src/workspace.jl")
 include("../DynamicPlanning.jl/src/robot.jl")
 
 """
-TODO
+Represents a precomputed reachable set that can be transformed and intersected with obstacles
+
+# Fields
+- `polytopes`: Collection of convex polygons representing the reachable set
+- `is_unified`: Whether polytopes have been unioned (for efficiency)
 """
-function reachable_set(R::Robot, T::Float64)
-    # Extract Initial Conditions and Control Bounds 
-    x_bounds = bounds_to_tuples(get_bounds(R, :x))
-    u_bounds = bounds_to_tuples(get_bounds(R, :u))
-
-    # Compute Base Reachable Set
-    reach_set = compute_reachable_union_of_convex(R.x0, u_bounds, x_bounds, T, R.dynamics)
-
-    return reach_set
+struct ReachableSet
+    polytopes::Vector{VPolygon}
+    is_unified::Bool
 end
 
-
 """
-Rotate collection of convex polytopes by angle θ around point x
+Compute reachable set for robot over time horizon T
 
 # Arguments
-- `S::Vector{VPolygon}`: collection of convex polytopes
-- `θ::Float64`: rotation angle in radians (counterclockwise positive)
-- `x::Vector{Float64}`: center of rotation [x, y]
+- `robot`: Robot object with dynamics, initial state, constraints, and shape
+- `T`: Time horizon
+- `n_segments`: Control space discretization (higher = more accurate, slower)
+- `n_samples`: Samples per segment (higher = smoother polytopes)
 
 # Returns
-- `Vector{VPolygon}`: rotated polytopes
+- `ReachableSet`: Precomputed reachable set
 """
-function rotate_reachable_sets(S::Vector, θ::Float64, x::Vector)
-    # Rotation matrix
-    R = [cos(θ) -sin(θ);
-         sin(θ)  cos(θ)]
+function compute_reachable_set(robot, T::Float64; n_segments::Int=8, n_samples::Int=15)
+    # Extract bounds
+    x_bounds = bounds_to_tuples(get_bounds(robot, :x))
+    u_bounds = bounds_to_tuples(get_bounds(robot, :u))
     
-    rotated_sets = VPolygon[]
+    # Compute polytopes
+    @info "Computing reachable set (T=$T, segments=$n_segments, samples=$n_samples)..."
+    polytopes = compute_reachable_polytopes(
+        robot.x0, u_bounds, x_bounds, T, robot.dynamics;
+        n_segments=n_segments, n_samples=n_samples
+    )
+    @info "  → Generated $(length(polytopes)) convex polytopes"
     
-    for poly in S
-        # Extract vertices
-        vertices = poly.vertices
-        
-        # Translate to origin, rotate, translate back
-        rotated_vertices = [R * (v - x) + x for v in vertices]
-        
-        # Construct new polytope
-        push!(rotated_sets, VPolygon(rotated_vertices))
-    end
-    
-    return rotated_sets
+    return ReachableSet(polytopes, false)
 end
 
 """
-Precompute the Minkowski difference with obstacles
+Transform reachable set by rotation and translation
+
+# Arguments
+- `reach_set`: ReachableSet to transform
+- `θ`: Rotation angle in radians (around origin)
+- `displacement`: Translation vector [dx, dy]
+
+# Returns
+- `ReachableSet`: Transformed reachable set
 """
-function precompute_obstacles(R::Robot, W::Workspace)
-    # Apply the Minkowski sum to the obstacles 
-    c_obstacles = []
-    for obstacle ∈ W.obstacles 
-        # Negate robot shape (reflect through origin)
-        negated_robot = LinearMap(-I, R.shape)
-        
-        # Convert to VPolygon for vertex-based computation
-        robot_poly = overapproximate(negated_robot, VPolygon)
-        
-        # Compute Minkowski sum (exact for polygons)
-        result = MinkowskiSum(obstacle, robot_poly)
+function transform(reach_set::ReachableSet, θ::Float64, displacement::Vector{Float64})
+    transformed = transform_polygons(reach_set.polytopes, θ, displacement)
+    return ReachableSet(transformed, reach_set.is_unified)
+end
 
-        push!(c_obstacles, overapproximate(result, VPolygon))
+"""
+Precompute configuration space obstacles from workspace obstacles
+
+# Arguments
+- `robot`: Robot with shape geometry
+- `workspace`: Workspace with obstacles
+
+# Returns
+- `Vector{VPolygon}`: Configuration space obstacles (Minkowski sums)
+"""
+function precompute_c_space_obstacles(robot, workspace)
+    @info "Computing configuration space obstacles..."
+    
+    # Extract robot shape as polygon
+    robot_poly = overapproximate(robot.shape, VPolygon)
+    
+    c_obstacles = VPolygon[]
+    for obs in workspace.obstacles
+        obs_poly = overapproximate(obs, VPolygon)
+        c_obs = minkowski_sum_obstacle(obs_poly, robot_poly)
+        push!(c_obstacles, c_obs)
     end
-
+    
+    @info "  → Processed $(length(c_obstacles)) obstacles"
     return c_obstacles
 end
 
-
 """
-Optimized reachable set difference computation using spatial indexing.
-Assumes obstacles are non-overlapping or minimally overlapping.
+Compute safe (obstacle-free) reachable set
 
 # Arguments
-- `convex_sets::Vector{VPolygon}`: collection of reachable set polytopes
-- `obstacles::Vector{VPolygon}`: non-overlapping configuration space obstacles
+- `reach_set`: ReachableSet to filter
+- `c_space_obstacles`: Configuration space obstacles
+- `batch_size`: Tuning parameter for union frequency (default: 10)
 
 # Returns
-- `Vector{Vector{VPolygon}}`: nested array of polygon fragments after obstacle subtraction
+- `ReachableSet`: Safe reachable set with obstacles removed
 """
-function subtract_obstacles(convex_sets::Vector, obstacles::Vector; batch_size=5)
-    current_safe_region = clipper_union(convex_sets)
+function compute_safe_reachable_set(reach_set::ReachableSet, 
+                                   c_space_obstacles::Vector{VPolygon};
+                                   batch_size::Int=10)
     
-    # Process obstacles in batches
-    for batch_start in 1:batch_size:length(obstacles)
-        batch_end = min(batch_start + batch_size - 1, length(obstacles))
-        batch = obstacles[batch_start:batch_end]
-        
-        all_fragments = VPolygon[]
-        
-        for poly in current_safe_region
-            # Subtract all obstacles in batch from this polytope
-            result_poly = [poly]
-            
-            for obs in batch
-                next_result = VPolygon[]
-                for fragment in result_poly
-                    if !isdisjoint(fragment, obs)
-                        diff_result = clip_difference(fragment, obs)
-                        if diff_result isa Vector
-                            append!(next_result, filter(r -> LazySets.area(r) > 1e-12, diff_result))
-                        end
-                    else
-                        push!(next_result, fragment)
-                    end
-                end
-                result_poly = next_result
-            end
-            
-            append!(all_fragments, result_poly)
-        end
-        
-        # Union after each batch
-        current_safe_region = clipper_union(all_fragments)
-        @info "After batch $(batch_start):$(batch_end), $(length(current_safe_region)) components remain"
-    end
+    # safe_polytopes = subtract_obstacles(reach_set.polytopes, c_space_obstacles; 
+    #                                    batch_size=batch_size)
+    safe_polytopes = subtract_obstacles(reach_set.polytopes, c_space_obstacles)
     
-    return current_safe_region
+    return ReachableSet(safe_polytopes, true)  # Mark as unified after subtraction
 end
 
+"""
+Check if a point is in the reachable set
 
+# Arguments
+- `reach_set`: ReachableSet to query
+- `point`: Query point [x, y]
 
+# Returns
+- `Bool`: True if point is reachable
+"""
+function contains(reach_set::ReachableSet, point::Vector{Float64})
+    return any(point ∈ poly for poly in reach_set.polytopes)
+end
 
-# function subtract_obstacles(convex_sets::Vector, obstacles::Vector)
-#     # First unify all reachable polytopes
-#     @info "Computing union of $(length(convex_sets)) polytopes..."
-#     unified = clipper_union(convex_sets)
-#     @info "Union produced $(length(unified)) connected components"
-    
-#     # Now subtract obstacles from unified set
-#     obstacle_boxes = [bounding_box(obs) for obs in obstacles]
-#     result = VPolygon[]
-    
-#     for poly in unified
-#         fragments = clip_difference_spatial(poly, obstacles, obstacle_boxes)
-#         append!(result, fragments)
-#     end
-    
-#     return result
-# end
+"""
+Get total area of reachable set
+"""
+function area(reach_set::ReachableSet)
+    if reach_set.is_unified
+        # Polytopes are disjoint after union
+        return sum(LazySets.area, reach_set.polytopes)
+    else
+        # May have overlaps - union first for accurate area
+        unified = polygon_union(reach_set.polytopes)
+        return sum(LazySets.area, unified)
+    end
+end
 
-
-
-
-
-
-# function subtract_obstacles(convex_sets::Vector, obstacles::Vector)
-#     # Precompute bounding boxes for all obstacles
-#     obstacle_boxes = [bounding_box(obs) for obs in obstacles]
-    
-#     # Process each reachable set and flatten results
-#     result = VPolygon[]
-#     for poly in convex_sets
-#         fragments = clip_difference_spatial(poly, obstacles, obstacle_boxes)
-#         append!(result, fragments)
-#     end
-    
-#     return result
-# end
 

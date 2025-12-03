@@ -1,5 +1,4 @@
-using DifferentialEquations, Plots, LazySets, LinearAlgebra
-using Clipper   
+using DifferentialEquations, Plots, LazySets, LinearAlgebra 
 
 include("../DynamicPlanning.jl/src/workspace.jl")
 include("../DynamicPlanning.jl/src/robot.jl")
@@ -8,8 +7,9 @@ include("../DynamicPlanning.jl/src/models.jl")
 include("reachability.jl")
 
 
-x0 = [-3.0, -2.5, 0.0]
-T = 7.0
+#x0 = [-3.0, -2.5, 0.0]
+x0 = [0.0, 0.0, 0.0]
+T = 10.0
 
 
 # Define the workspace
@@ -17,7 +17,7 @@ T = 7.0
 
 # Define and add obstacles 
 𝒪 = create_pursuit_evasion_obstacles(𝒲)
-add_obstacles!(𝒲, 𝒪)
+add_obstacles!(𝒲, [𝒪[12], 𝒪[15]])
 
 # Define a robot
 l = 0.2
@@ -29,101 +29,57 @@ add_box_constraint!(R, [-0.25, -pi/3], [0.25, pi/3], :u)
 add_box_constraint!(R, [-10, -10, -pi/3], [10, 10, pi/3], :x)
 
 
-# Compute the reachable set
-reach_set = reachable_set(R, T)
+# 1. Compute offline reachable set
+reach_set = compute_reachable_set(R, T; n_segments=10, n_samples=20)
 
-# Rotate
-reach_set = rotate_reachable_sets(reach_set, π/4, x0[1:2])
+# 2. Precompute configuration space obstacles
+c_obstacles = precompute_c_space_obstacles(R, 𝒲)
 
-# Precompute C-space-like obstacles
-new_obstacles = precompute_obstacles(R, 𝒲)
+# 3. At runtime: transform reachable set to current pose
+current_reach = transform(reach_set, 0.0, x0[1:2])
 
-
-# Remove the obstacles
-constrained_reach_set = subtract_obstacles(reach_set, new_obstacles)
-
+# 4. Subtract obstacles to get safe region
+safe_reach = compute_safe_reachable_set(current_reach, c_obstacles)
+#safe_reach = compute_safe_reachable_set(reach_set, c_obstacles)
 
 # Plot
+# # After computing safe_reach
+# println("Number of safe region components: ", length(safe_reach.polytopes))
+# println("Total safe area: ", sum(LazySets.area, safe_reach.polytopes))
+# println("Original reachable area (approx): ", sum(LazySets.area, reach_set.polytopes))
+# println("Obstacle area: ", sum(LazySets.area, c_obstacles))
+
+# Plot ALL components
 p1 = plot()
-
-for poly in new_obstacles
-    plot!(p1, poly, alpha=0.3, linecolor=:black, color=:grey)
+for (i, poly) in enumerate(c_obstacles)
+    plot!(p1, poly, alpha=0.3, linecolor=:black, label=i)
 end
+# plot!(p1, c_obstacles[12], alpha=0.3, linecolor=:black, label=12)
+# plot!(p1, c_obstacles[15], alpha=0.3, linecolor=:black, label=15)
 
-for poly in constrained_reach_set
-    plot!(p1, poly, alpha=0.3, linecolor=:black, color=:red)
+for (i, poly) in enumerate(safe_reach.polytopes)
+    plot!(p1, poly, alpha=0.3, linecolor=:black, color=:red, 
+          label=(i==1 ? "Safe region" : ""))
 end
-
 
 display(p1)
 
 
-# function diagnose_boundary_intersections(convex_sets::Vector, obstacles::Vector)
-#     obstacle_boxes = [bounding_box(obs) for obs in obstacles]
-    
-#     for obs_idx in 1:length(obstacles)
-#         obs = obstacles[obs_idx]
-        
-#         # Find all polytopes that intersect this obstacle
-#         intersecting_polys = [i for i in 1:length(convex_sets)
-#                              if !isdisjoint(convex_sets[i], obs)]
-        
-#         if length(intersecting_polys) > 1
-#             @info "Obstacle $obs_idx intersects $(length(intersecting_polys)) polytopes"
-            
-#             # Check for shared boundary regions
-#             for i in 1:length(intersecting_polys)-1
-#                 for j in i+1:length(intersecting_polys)
-#                     p1 = convex_sets[intersecting_polys[i]]
-#                     p2 = convex_sets[intersecting_polys[j]]
-                    
-#                     boundary_intersection = intersection(p1, p2)
-#                     if !isempty(boundary_intersection)
-#                         obs_on_boundary = intersection(boundary_intersection, obs)
-#                         if !isempty(obs_on_boundary)
-#                             @warn "Obstacle intersects polytope boundary" obs_idx i j area=LazySets.area(obs_on_boundary)
-#                         end
-#                     end
-#                 end
-#             end
-#         end
-#     end
-# end
 
-
-# diagnose_boundary_intersections(reach_set, new_obstacles)
-
-
-
-
-
-
-
-
-
-
-
-
-# convex_sets = compute_reachable_union_of_convex(
-#     x0, y0, θ0, v_bounds, ω_bounds, T,
-#     n_segments=6, n_samples_per_segment=10
-# )
-
-# # Example obstacle polygon
-# P = VPolygon([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
-
-# # Compute differences using Clipper
-# reach_set = ReachableDifference(convex_sets, P)
-
-# # Flatten for plotting (may be empty)
-# flat = vcat(reach_set...)   # if reach_set contains empty arrays this will still work
 
 # p1 = plot()
-# for poly in flat
+
+# for poly in c_obstacles
+#     plot!(p1, poly, alpha=0.3, linecolor=:black, color=:grey)
+# end
+
+# # for poly in reach_set.polytopes
+# #     plot!(p1, poly, alpha=0.2, linecolor=:black, color=:yellow)
+# # end
+
+# for poly in safe_reach.polytopes
 #     plot!(p1, poly, alpha=0.3, linecolor=:black, color=:red)
 # end
 
 # display(p1)
 
-
-# plot!(P, alpha=0.6, linecolor=:red)

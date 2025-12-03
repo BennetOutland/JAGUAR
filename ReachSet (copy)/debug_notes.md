@@ -1,0 +1,3 @@
+- Issue is something that deals with the set difference operator
+- Checking in polygon_difference_geos
+    -
