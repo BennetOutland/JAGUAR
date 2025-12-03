@@ -331,6 +331,14 @@ function plot_reachable_set_raster!(p, reach_set::ReachableSet;
               colorbar=false,
               label=label,
               kwargs...)
+
+    scatter!(p, [NaN], [NaN], 
+        markersize=10, 
+        markershape=:square,
+        markercolor=color,
+        markeralpha=alpha,
+        label=label,
+        markerstrokewidth=0)
     
     return p
 end
@@ -503,7 +511,7 @@ Convert VPolygon to LibGEOS Polygon
 function to_geos(poly::VPolygon)
     # Validate polygon has vertices
     if length(poly.vertices) < 3
-        error("Cannot convert VPolygon with < 3 vertices to GEOS polygon. Has $(length(poly.vertices)) vertices.")
+        @warn "Cannot convert VPolygon with < 3 vertices to GEOS polygon. Has $(length(poly.vertices)) vertices."
     end
     
     # GEOS requires closed rings (first point == last point)

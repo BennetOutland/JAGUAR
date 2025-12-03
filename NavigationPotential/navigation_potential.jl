@@ -14,418 +14,225 @@ include("../DynamicPlanning.jl/src/workspace.jl")
 # Usings 
 using LinearAlgebra
 using LazySets
-import LazySets: overapproximate
 using Plots
 using Statistics
 
-# Define a custom overapproximation method with tighter fit
-function LazySets.overapproximate(S::VPolygon, ::Type{Ball2})
-    verts = vertices_list(S)
-    c = mean(verts)
-    # Use minimum enclosing circle radius (tighter fit)
-    r = maximum(norm(v - c) for v in verts)
-    # Scale down to get tighter approximation
-    r_tight = 0.7 * r  # Adjust this factor as needed (0.5-0.9)
-    return Ball2(c, r_tight)
+# ============================================================================
+# Distance Functions
+# ============================================================================
+
+distance(x1, x2) = norm(x1 - x2)
+
+# ============================================================================
+# Boundary Functions (b_i)
+# ============================================================================
+
+function b_sphere(x, ball::Ball2)
+    """Returns b_i(x) = ||x - x_i||² - r_i²"""
+    return norm(x - ball.center)^2 - ball.radius^2
 end
 
-"""
-Wrap angle to [-π, π].
-"""
-function wrap_angle(θ::Float64)
-    return mod(θ + π, 2π) - π
+function b_workspace(x, ball::Ball2)
+    """Returns b_0(x) = r_0² - ||x||²"""
+    return ball.radius^2 - norm(x)^2
 end
 
-"""
-Compute the approximate SE(2) distance using weighted Euclidean metric.
+function compute_b_product(x, obstacles, workspace)
+    """Returns b(x) = b_0(x) * ∏ b_i(x)"""
+    b_prod = b_workspace(x, workspace)
+    for obs in obstacles
+        b_prod *= b_sphere(x, obs)
+    end
+    return b_prod
+end
 
-d(x₁, x₂) ≈ √(c₁||t₁ - t₂||² + c₂·wrap(θ₂ - θ₁)²)
-"""
-function se2_distance_approx(x1::Vector{Float64}, x2::Vector{Float64};
-                            c1::Float64=1.0, c2::Float64=1.0)
-    # Extract positions
-    t1 = x1[1:2]
-    t2 = x2[1:2]
+# ============================================================================
+# Sphere Space Navigation Function (ψ)
+# ============================================================================
+
+function psi(x, x_goal, obstacles, workspace, k)
+    """
+    ψ(x) = d²(x, x_goal) / [b(x) + d^(2k)(x, x_goal)]^(1/k)
+    """
+    d_goal = distance(x, x_goal)
+    b_val = compute_b_product(x, obstacles, workspace)
     
-    # Translational component
-    trans_dist_sq = norm(t1 - t2)^2
-    
-    # Rotational component (if orientation is provided)
-    if length(x1) >= 3 && length(x2) >= 3
-        θ1 = x1[3]
-        θ2 = x2[3]
-        Δθ = wrap_angle(θ2 - θ1)
-        rot_dist_sq = Δθ^2
-    else
-        rot_dist_sq = 0.0
+    if b_val <= 0
+        return NaN  # Invalid region
     end
     
-    # Weighted distance
-    return sqrt(c1 * trans_dist_sq + c2 * rot_dist_sq)
+    return d_goal^2 / (b_val + d_goal^(2*k))^(1/k)
 end
 
-"""
-Compute b_i(x) = d²(x, x_i) - r_i²
+# ============================================================================
+# Star World Transformation Components
+# ============================================================================
 
-Returns ≤ 0 inside obstacle, > 0 outside obstacle.
-Uses Euclidean distance to obstacle center.
-"""
-function b_i(x::Vector{Float64}, obs, d::Function)
-    sphere_set = overapproximate(obs, Ball2)
+function compute_nu_i(x, obs, r_i)
+    """
+    ν_i(x) = √(1 + b_i(x)) * r_i / d(x, x_i)
+    """
+    b_i = b_sphere(x, obs)
+    d_val = distance(x, obs.center)
     
-    # Extract 2D position and use Euclidean distance
-    x_pos = x[1:2]
-    center_pos = sphere_set.center
+    # Handle singularities
+    if d_val < 1e-10
+        d_val = 1e-10
+    end
     
-    dist = norm(x_pos - center_pos)
-    return dist^2 - sphere_set.radius^2
+    if 1 + b_i < 0
+        return 1.0  # Fallback for points inside obstacle
+    end
+    
+    return sqrt(1 + b_i) * r_i / d_val
 end
 
-"""
-Compute b(x) = ∏ᵢ bᵢ(x)
-Product of all obstacle functions.
-"""
-function b_product(x::Vector{Float64}, W::Workspace, d::Function)
-    if isempty(W.obstacles)
-        return 1.0
-    end
-    
-    # Use log-space to prevent overflow
-    log_b_sum = 0.0
-    for obs in W.obstacles
-        bi = b_i(x, obs, d)
-        if bi <= 0.0
-            return -Inf  # Inside obstacle
-        end
-        log_b_sum += log(bi)
-    end
-    
-    return exp(log_b_sum)
+function compute_T_i(x, obs, p_i, r_i)
+    """
+    T_i(x) = ν_i(x)(x - x_i) + p_i
+    """
+    x_i = obs.center
+    nu_i = compute_nu_i(x, obs, r_i)
+    return nu_i * (x - x_i) + p_i
 end
 
-"""
-Compute b̄ᵢ(x) = ∏_{j≠i} bⱼ(x)
-Product of all obstacle functions except obstacle i.
-"""
-function b_bar_i(x::Vector{Float64}, W::Workspace, i::Int, d::Function)
-    if isempty(W.obstacles)
-        return 1.0
+# ============================================================================
+# Switching Functions (σ)
+# ============================================================================
+
+# ============================================================================
+# Switching Functions (σ) - FIXED VERSION
+# ============================================================================
+
+function compute_b_bar_i(x, i, obstacles, workspace)
+    """
+    Compute b̄_i(x) = b_0(x) * ∏_{j≠i} b_j(x)
+    Returns NaN if any component is ≤ 0 (invalid region)
+    """
+    b_bar = b_workspace(x, workspace)
+    
+    if b_bar <= 0
+        return NaN
     end
     
-    log_b_sum = 0.0
-    for (j, obs) in enumerate(W.obstacles)
+    for (j, obs) in enumerate(obstacles)
         if j != i
-            bi = b_i(x, obs, d)
-            if bi <= 0.0
-                return -Inf
+            b_j = b_sphere(x, obs)
+            if b_j <= 0
+                return NaN
             end
-            log_b_sum += log(bi)
+            b_bar *= b_j
         end
     end
     
-    return exp(log_b_sum)
+    return b_bar
 end
 
-"""
-Compute ηᵢ(x) for obstacle i.
-Default implementation: ηᵢ(x) = 1.0
-"""
-function eta_i(x::Vector{Float64}, obs, d::Function)
-    return 1.0
-end
-
-"""
-Compute νᵢ(x) = (1 + bᵢ(x))^(1/2) * rᵢ / d(x, xᵢ)
-Scaling factor for transformation Tᵢ.
-"""
-function nu_i(x::Vector{Float64}, obs, d::Function)
-    sphere_set = overapproximate(obs, Ball2)
-    bi = b_i(x, obs, d)
+function compute_sigma_i(x, i, obstacles, workspace, μ)
+    """
+    σ_i(x, μ) = (η_i * b̄_i) / (μ * b_i + η_i * b̄_i)
     
-    # Use Euclidean distance to obstacle center (not d function)
-    x_pos = x[1:2]
-    dist = norm(x_pos - sphere_set.center)
+    Returns 0 if point is not in free space
+    """
+    b_i = b_sphere(x, obstacles[i])
     
-    return sqrt(max(1.0 + bi, 0.0)) * sphere_set.radius / max(dist, 1e-10)
-end
-
-"""
-Compute switching function σᵢ(x, μ) = ηᵢ(x)b̄ᵢ(x) / [μ·bᵢ(x) + ηᵢ(x)b̄ᵢ(x)]
-Determines blending between obstacle transformations.
-"""
-function sigma_i(x::Vector{Float64}, W::Workspace, i::Int, d::Function, mu::Float64)
-    obs = W.obstacles[i]
-    bi = b_i(x, obs, d)
-    b_bar = b_bar_i(x, W, i, d)
-    eta = eta_i(x, obs, d)
+    # Point inside obstacle i
+    if b_i <= 0
+        return 0.0
+    end
     
-    numerator = eta * b_bar
-    denominator = mu * bi + eta * b_bar
+    b_bar_i = compute_b_bar_i(x, i, obstacles, workspace)
+    
+    # Point in invalid region (inside another obstacle or outside workspace)
+    if isnan(b_bar_i) || b_bar_i <= 0
+        return 0.0
+    end
+    
+    η_i = 1.0
+    numerator = η_i * b_bar_i
+    denominator = μ * b_i + η_i * b_bar_i
     
     return numerator / denominator
 end
 
-"""
-Compute transformation Tᵢ(x) = νᵢ(x)(x - xᵢ) + pᵢ
-where xᵢ is the obstacle center and pᵢ = xᵢ.
-Returns same dimensionality as input x.
-"""
-function T_i(x::Vector{Float64}, obs, d::Function)
-    sphere_set = overapproximate(obs, Ball2)
-    nu = nu_i(x, obs, d)
+function compute_sigma_goal(x, obstacles, workspace, μ)
+    """
+    σ_goal = 1 - ∑ σ_i
     
-    # Extract 2D position
-    x_pos = x[1:2]
-    center_pos = sphere_set.center
-    
-    # Tᵢ(x) = νᵢ(x)(x - xᵢ) + pᵢ, with pᵢ = xᵢ
-    transformed_pos = nu * (x_pos - center_pos) + center_pos
-    
-    # Return with same dimensionality as input
-    if length(x) >= 3
-        return [transformed_pos[1], transformed_pos[2], x[3]]
-    else
-        return transformed_pos
-    end
-end
-
-"""
-Compute the mapping h(x) from sphere space to star space:
-h(x) = σ_goal(x, μ)T_goal(x) + ∑ᵢ σᵢ(x, μ)Tᵢ(x)
-where T_goal(x) = x.
-"""
-function h_mapping(x::Vector{Float64}, W::Workspace, d::Function, mu::Float64)
-    n_dim = length(x)
-    n_obs = length(W.obstacles)
-    
-    if n_obs == 0
-        return x  # No obstacles, identity mapping
-    end
-    
-    # Compute all switching functions
-    sigmas = zeros(n_obs)
-    sigma_sum = 0.0
-    
-    for (i, obs) in enumerate(W.obstacles)
-        sigmas[i] = sigma_i(x, W, i, d, mu)
-        sigma_sum += sigmas[i]
-    end
-    
-    # σ_goal = 1 - ∑ᵢ σᵢ
-    sigma_goal = 1.0 - sigma_sum
-    
-    # Apply transformations
-    transformed = zeros(n_dim)
-    for (i, obs) in enumerate(W.obstacles)
-        transformed += sigmas[i] * T_i(x, obs, d)
-    end
-    
-    # T_goal(x) = x
-    return sigma_goal * x + transformed
-end
-
-"""
-Compute sphere-space potential function:
-ψ(x) = d²(x, x_goal) / [b(x) + d^(2k)(x, x_goal)]^(1/k)
-where b(x) = ∏ᵢ bᵢ(x).
-"""
-function psi(x::Vector{Float64}, x_goal::Vector{Float64}, W::Workspace, 
-            d::Function, k::Int)
-    
-    d_goal = d(x, x_goal)
-    
-    # At goal
-    if d_goal < 1e-10
+    Only defined in free space
+    """
+    # First check if we're in free space
+    if compute_b_product(x, obstacles, workspace) <= 0
         return 0.0
     end
     
-    d_goal_sq = d_goal^2
-    d_goal_2k = d_goal^(2*k)
-    
-    # Compute b(x) = ∏ᵢ bᵢ(x)
-    b = b_product(x, W, d)
-    
-    if b == -Inf || b <= 0.0
-        # Inside or touching obstacle
-        return 1e6
+    sum_sigma = 0.0
+    for i in 1:length(obstacles)
+        sum_sigma += compute_sigma_i(x, i, obstacles, workspace, μ)
     end
     
-    # ψ(x) = d²(x, x_goal) / [b(x) + d^(2k)(x, x_goal)]^(1/k)
-    sum_term = b + d_goal_2k
-    denominator = sum_term^(1.0/k)
-    potential = d_goal_sq / denominator
-    
-    return clamp(potential, 0.0, 1e6)
+    return 1.0 - sum_sigma
 end
 
-"""
-Navigation potential function φ(x) = ψ(h(x)).
+# ============================================================================
+# Diffeomorphism h: Star World → Sphere World
+# ============================================================================
 
-This is the complete navigation potential field with guaranteed convergence
-to the goal without local minima in star-space workspaces.
-
-Parameters:
-- W: Workspace containing obstacles
-- x0: Current position [x, y] or [x, y, θ]
-- xf: Goal position [x, y] or [x, y, θ]
-- d: Distance metric function
-- k: Sharpening parameter (default: 3)
-- mu: Tuning parameter for switching functions (default: 1.0)
-- use_star_space: If true, use star-space mapping h(x); if false, use sphere-space only
-
-Returns: Scalar potential value at x0
-"""
-function NavigationPotentialFunction(W::Workspace, x0::Vector{Float64}, 
-                                    xf::Vector{Float64}, d::Function; 
-                                    k::Int=3, mu::Float64=1.0,
-                                    use_star_space::Bool=true)
-    if use_star_space && !isempty(W.obstacles)
-        # Star-space formulation: φ(x) = ψ(h(x))
-        h_x = h_mapping(x0, W, d, mu)
-        return psi(h_x, xf, W, d, k)
-    else
-        # Sphere-space formulation: φ(x) = ψ(x)
-        return psi(x0, xf, W, d, k)
+function h_mapping(x, obstacles, workspace, μ, p_vals, r_vals)
+    """
+    h(x) = σ_goal(x, μ) * T_goal(x) + ∑ σ_i(x, μ) * T_i(x)
+    
+    Only valid in free space - returns x for invalid regions
+    """
+    # Check free space
+    if compute_b_product(x, obstacles, workspace) <= 0
+        return x  # Or return NaN if you prefer
     end
+    
+    σ_goal = compute_sigma_goal(x, obstacles, workspace, μ)
+    result = σ_goal * x  # T_goal is identity
+    
+    for (i, obs) in enumerate(obstacles)
+        σ_i = compute_sigma_i(x, i, obstacles, workspace, μ)
+        T_i = compute_T_i(x, obs, p_vals[i], r_vals[i])
+        result += σ_i * T_i
+    end
+    
+    return result
 end
 
-"""
-Compute gradient of navigation potential function using numerical differentiation.
+# ============================================================================
+# Star World Navigation Function (φ)
+# ============================================================================
 
-Parameters:
-- W: Workspace
-- x: Current position
-- xf: Goal position
-- d: Distance metric
-- k: Sharpening parameter
-- mu: Tuning parameter
-- epsilon: Step size for numerical differentiation
-- use_star_space: Whether to use star-space mapping
-
-Returns: Gradient vector ∇φ(x)
-"""
-function NavigationPotentialGradient(W::Workspace, x::Vector{Float64},
-                                    xf::Vector{Float64}, d::Function;
-                                    k::Int=3, mu::Float64=1.0, 
-                                    epsilon::Float64=1e-3,
-                                    use_star_space::Bool=true)
-    grad = zeros(length(x))
+function phi(x, x_goal, obstacles, workspace, k, μ)
+    """
+    φ(x) = ψ(h(x))
     
-    for i in 1:length(x)
-        x_plus = copy(x)
-        x_minus = copy(x)
-        x_plus[i] += epsilon
-        x_minus[i] -= epsilon
-        
-        phi_plus = NavigationPotentialFunction(W, x_plus, xf, d; k=k, mu=mu, use_star_space=use_star_space)
-        phi_minus = NavigationPotentialFunction(W, x_minus, xf, d; k=k, mu=mu, use_star_space=use_star_space)
-        
-        grad[i] = (phi_plus - phi_minus) / (2 * epsilon)
-    end
+    Navigation function for star worlds
+    """
+    # Use identity mapping: p_i = obstacle centers, r_i = obstacle radii
+    p_vals = [obs.center for obs in obstacles]
+    r_vals = [obs.radius for obs in obstacles]
     
-    return grad
+    h_x = h_mapping(x, obstacles, workspace, μ, p_vals, r_vals)
+    
+    return psi(h_x, x_goal, obstacles, workspace, k)
 end
 
-"""
-Plot navigation potential field as a heatmap.
+# ============================================================================
+# Conversion Utilities
+# ============================================================================
 
-Parameters:
-- W: Workspace
-- xf: Goal position
-- d: Distance function
-- k: Sharpening parameter (default: 3)
-- mu: Tuning parameter (default: 1.0)
-- resolution: Grid resolution (default: 100)
-- max_potential: Maximum potential value to display (default: 50.0)
-- use_star_space: Whether to use star-space mapping (default: true)
-"""
-function plot_navigation_potential(W::Workspace, xf::Vector{Float64}, 
-                                  d::Function;
-                                  k::Int=3,
-                                  mu::Float64=1.0,
-                                  resolution::Int=100,
-                                  max_potential::Float64=50.0,
-                                  use_star_space::Bool=true)
-    
-    # Compute workspace bounds
-    all_x = Float64[]
-    all_y = Float64[]
-    
-    for obs in W.obstacles
-        verts = vertices_list(obs)
-        append!(all_x, [v[1] for v in verts])
-        append!(all_y, [v[2] for v in verts])
-    end
-    
-    push!(all_x, xf[1])
-    push!(all_y, xf[2])
-    
-    margin = 0.2 * max(maximum(all_x) - minimum(all_x), 
-                      maximum(all_y) - minimum(all_y))
-    
-    xlims = (minimum(all_x) - margin, maximum(all_x) + margin)
-    ylims = (minimum(all_y) - margin, maximum(all_y) + margin)
-    
-    # Create grid
-    x_range = range(xlims[1], xlims[2], length=resolution)
-    y_range = range(ylims[1], ylims[2], length=resolution)
-    
-    # Compute potential at each grid point
-    Z = zeros(resolution, resolution)
-    valid_vals = Float64[]
-    
-    space_type = use_star_space ? "Star-Space" : "Sphere-Space"
-    println("Computing $(space_type) potential field over $(resolution)×$(resolution) grid...")
-    
-    for (i, y) in enumerate(y_range)
-        for (j, x) in enumerate(x_range)
-            point = length(xf) >= 3 ? [x, y, 0.0] : [x, y]
-            
-            # Check if inside any obstacle
-            inside = any(point[1:2] ∈ obs for obs in W.obstacles)
-            
-            if inside
-                Z[i, j] = NaN
-            else
-                phi = NavigationPotentialFunction(W, point, xf, d; k=k, mu=mu, use_star_space=use_star_space)
-                Z[i, j] = min(phi, max_potential)
-                push!(valid_vals, phi)
-            end
-        end
-    end
-    
-    # Print statistics
-    println("\nPotential field statistics:")
-    println("  Min: ", minimum(valid_vals))
-    println("  Max: ", maximum(valid_vals))
-    println("  Mean: ", mean(valid_vals))
-    println("  Median: ", median(valid_vals))
-    println("  Values > $(max_potential): ", count(v -> v > max_potential, valid_vals))
-    
-    # Create heatmap
-    title_str = "Navigation Potential Field ($(space_type), k=$k, μ=$mu)"
-    
-    p = heatmap(x_range, y_range, Z,
-                xlabel="x", ylabel="y",
-                title=title_str,
-                colorbar_title="φ",
-                aspect_ratio=:equal,
-                color=:viridis)
-    
-    # Overlay obstacles
-    for obs in W.obstacles
-        verts = vertices_list(obs)
-        verts_closed = vcat(verts, [verts[1]])
-        xs = [v[1] for v in verts_closed]
-        ys = [v[2] for v in verts_closed]
-        plot!(p, xs, ys, linewidth=2, color=:red, label="", 
-              fillalpha=0.3, fill=true, fillcolor=:red)
-    end
-    
-    # Mark goal
-    scatter!(p, [xf[1]], [xf[2]], marker=:star, markersize=10, 
-             color=:yellow, markerstrokecolor=:black, markerstrokewidth=2,
-             label="Goal")
-    
-    return p
+to_Ball2(E::Ellipsoid) = Ball2(E.center, sqrt(maximum(eigvals(E.shape_matrix))))
+
+function to_Ball2(P::VPolygon)
+    c = sum(P.vertices) / length(P.vertices)
+    r = maximum(norm(v - c) for v in P.vertices)
+    return Ball2(c, r)
 end
+
+to_Ball2(B::Ball2) = B
+
+
+
