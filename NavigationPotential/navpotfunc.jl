@@ -47,7 +47,7 @@ zeta   = 1.0
 Q_star = 2.0
 eta    = 60.0
 
-P = PotentialFunction(d_star, zeta, Q_star, eta, x_init, x_goal, 𝒲.obstacles)
+P = PotentialFunction(d_star, zeta, Q_star, eta, x_init, x_goal, 𝒲.obstacles, 𝒲_ball)
 
 
 # Define your domain and grid
@@ -64,7 +64,7 @@ field = zeros(length(ys), length(xs))
 for (i, yi) in enumerate(ys)
     for (j, xj) in enumerate(xs)
         pos = [xj, yi] 
-        field[i, j] = P(pos, 𝒲_ball) # Compute potential here
+        field[i, j] = P(pos) # Compute potential here
     end
 end
 
@@ -85,9 +85,9 @@ for (i, poly) in enumerate(𝒲.obstacles)
           label=(i == 1 ? "Obstacles" : ""))
 end
 # Add goal
-scatter!(p, [xg[1]], [xg[2]], 
-         marker=:star, markersize=10, 
-         markercolor=:white, label="Goal")
+# scatter!(p, [xg[1]], [xg[2]], 
+#          marker=:star, markersize=10, 
+#          markercolor=:white, label="Goal")
 
 box = box_approximation(𝒲.bounds)
 l = low(box)

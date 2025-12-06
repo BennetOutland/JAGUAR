@@ -651,13 +651,13 @@ function polygon_difference_geos(A::VPolygon, B::VPolygon)
     geom_A = to_geos(A)
     geom_B = to_geos(B)
     
-    println("A valid: ", LibGEOS.isValid(geom_A))
-    println("B valid: ", LibGEOS.isValid(geom_B))
+    # println("A valid: ", LibGEOS.isValid(geom_A))
+    # println("B valid: ", LibGEOS.isValid(geom_B))
     
     result_geom = LibGEOS.difference(geom_A, geom_B)
     
-    println("Result valid: ", LibGEOS.isValid(result_geom))
-    println("Result is empty: ", LibGEOS.isEmpty(result_geom))
+    # println("Result valid: ", LibGEOS.isValid(result_geom))
+    # println("Result is empty: ", LibGEOS.isEmpty(result_geom))
     
     return from_geos(result_geom)
 end
@@ -761,7 +761,7 @@ function compute_reachable_polytopes(x0::Vector,
             
             # Solve ODE
             prob = ODEProblem(dynamics!, x0, (0.0, T), ctrl)
-            sol = solve(prob, Tsit5(), callback=cb, saveat=dt)
+            sol = DifferentialEquations.solve(prob, Tsit5(), callback=cb, saveat=dt)
             
             # Extract 2D position (assumes first 2 states are spatial)
             push!(points, [sol[end][1], sol[end][2]])
@@ -864,7 +864,7 @@ function subtract_obstacles(
 
     # Process each reachable polytope independently
     for (j, poly) in enumerate(reachable_polytopes)
-        @info "Processing reachable polytope $j/$(length(reachable_polytopes))..."
+        #@info "Processing reachable polytope $j/$(length(reachable_polytopes))..."
         current_parts = [poly]
 
         # Subtract each obstacle sequentially

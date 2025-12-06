@@ -129,6 +129,7 @@ struct PotentialFunction
     q_init::Vector
     q_goal::Vector
     obstacles::Vector{VPolygon}
+    ws::Any
 end
 
 
@@ -136,12 +137,13 @@ end
 # Potential Value
 #############################
 
-function (P::PotentialFunction)(q::Vector, ws::Ball2)
+function (P::PotentialFunction)(q)
     # Attractive term
-    dist = norm(q - P.q_goal)
-    potential = dist ≤ P.d_star ?
-        0.5 * P.zeta * dist^2 :
-        P.d_star * P.zeta * dist - 0.5 * P.zeta * P.d_star^2
+    # dist = norm(q - q_goal)
+    # potential = dist ≤ P.d_star ?
+    #     0.5 * P.zeta * dist^2 :
+    #     P.d_star * P.zeta * dist - 0.5 * P.zeta * P.d_star^2
+    potential = 0.0
 
     # Repulsive obstacles
     for obs in P.obstacles
@@ -152,7 +154,7 @@ function (P::PotentialFunction)(q::Vector, ws::Ball2)
     end
 
     # Repulsive workspace (outside)
-    d_ws = dist_outside_workspace(q, ws)
+    d_ws = dist_outside_workspace(q, P.ws)
     if d_ws > 1e-6
         # can reuse eta or define separate weight
         potential += 0.5 * P.eta * (1/d_ws)^2

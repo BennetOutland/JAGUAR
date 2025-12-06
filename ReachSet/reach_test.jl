@@ -9,7 +9,8 @@ include("reachability.jl")
 include("sampling.jl")
 
 # Define initial conditions
-x0 = [-3.0, -2.5, 0.0]
+# x0 = [-3.0, -2.5, 0.0]
+x0 = [4.0, 4.0, 0.0]
 T = 20.0
 
 # Define the workspace
@@ -56,18 +57,18 @@ function objective(x)
 end
 
 # 5. Determine goal location
-x_opt = multi_start_optimization(
-    objective,
-    safe_reach.polytopes;
-    n_starts=10,
-    strategy=:uniform,
-    α=0.01
-)
+# x_opt = multi_start_optimization(
+#     objective,
+#     safe_reach.polytopes;
+#     n_starts=10,
+#     strategy=:uniform,
+#     α=0.01
+# )
 
-p1 = plot(aspect_ratio=:equal)
+x_opt = [[0.0, 0.0]]
 
 # Workspace 
-plot!(p1, 𝒲.bounds, c=:white)
+p1 = plot(𝒲.bounds, c=:white)
 
 # Plot obstacles
 for (i, poly) in enumerate(𝒲.obstacles)

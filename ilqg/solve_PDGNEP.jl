@@ -4,6 +4,9 @@ Organization: CU Boulder
 License/Control: MIT
 """
 
+# Includes 
+include("../DynamicPlanning.jl/src/constraints.jl")
+
 # Imports
 import iLQGames: dx
 
@@ -19,7 +22,13 @@ using LaTeXStrings
 #                              DYNAMICS
 #+=========================================================================+
 
-# Create the struct
+# # Create the struct
+nx = 6
+nxi = 3
+nu = 4
+nui = 2
+Δt = 0.1
+
 struct CBR <: ControlSystem{Δt,nx,nu} end
 
 
@@ -31,7 +40,7 @@ function f(x, u)
     dx = []
 
     # Loop through agents
-    for i ∈ eachindex(m_vec)
+    for i ∈ 1:2
 
         # Variables 
         xi = x[nxi*(i-1)+1:nxi*i]
@@ -74,19 +83,85 @@ function dummy_strategy(g)
     return SizedVector{h}(fill(zero_strategy, h))
 end
 
+
 """
-Compute log barrier penalty for inequality constraints g(x, u) ≤ 0.
-Returns -μ * sum(log(-g_i)) for all constraints.
-Assumes g_i < 0 for feasible points (strict interior required).
+Log barrier penalty function with element-wise upper/lower constraints.
+lcon and ucon are vectors with bounds for each element.
 """
-function log_barriers(g::AbstractVector, μ::Real)
-    barrier = zero(promote_type(eltype(g), typeof(μ)))
-    @inbounds @simd for i in eachindex(g)
-        barrier -= μ * log(-g[i])
+function log_barrier(q, lcon::Vector, ucon::Vector, μ)
+    barrier = 0.0
+    for (i, qi) ∈ enumerate(q)
+        barrier -= μ * (log(ucon[i] - qi) + log(qi - lcon[i]))
     end
     return barrier
 end
 
+
+"""
+Softer log barrier with quadratic transition near bounds
+"""
+function soft_log_barrier(x, lcon, ucon, μ, δ=0.1)
+    # Handle scalar bounds
+    if isa(lcon, Real)
+        lcon = fill(lcon, length(x))
+    end
+    if isa(ucon, Real)
+        ucon = fill(ucon, length(x))
+    end
+    
+    barrier = 0.0
+    for (i, xi) ∈ enumerate(x)
+        # Distance to bounds
+        d_upper = ucon[i] - xi
+        d_lower = xi - lcon[i]
+        
+        # Soft barrier: quadratic near bounds, log in interior
+        if d_upper < δ
+            barrier += μ * (d_upper - δ)^2 / (2*δ)
+        else
+            barrier -= μ * log(d_upper)
+        end
+        
+        if d_lower < δ
+            barrier += μ * (d_lower - δ)^2 / (2*δ)
+        else
+            barrier -= μ * log(d_lower)
+        end
+    end
+    return barrier
+end
+
+"""
+Penalty function for upper/lower constraints on a variable.
+Supports both scalar and vector bounds with NaN safety checks.
+"""
+function pf(x, lcon, ucon, μ)
+    # Handle scalar bounds (broadcast to all elements)
+    if isa(lcon, Real)
+        lcon = fill(lcon, length(x))
+    end
+    if isa(ucon, Real)
+        ucon = fill(ucon, length(x))
+    end
+    
+    p = 0.0
+    for (i, xi) ∈ enumerate(x)
+        # Check for NaN in input
+        if isnan(xi) || isnan(lcon[i]) || isnan(ucon[i])
+            @warn "NaN detected in penalty function at index $i: xi=$xi, lcon=$lcon[i], ucon=$ucon[i]"
+            return Inf  # Return large penalty for NaN
+        end
+        
+        # Upper violation: xi > ucon[i]
+        upper_violation = max(0.0, xi - ucon[i])
+        # Lower violation: xi < lcon[i]
+        lower_violation = max(0.0, lcon[i] - xi)
+        
+        p += μ * (upper_violation^2.0 + lower_violation^2.0)
+    end
+    
+    return p
+end
 
 #+=========================================================================+
 #                              PARAMETERS
@@ -95,28 +170,39 @@ end
 WIP
 """
 function SolvePDGNEP(N, x0_stack, X_stack, U_stack, T, dt, t0, constraints, potentials; ρ=1.0)
-    # Extract agent and stacked diemsnions 
-    nx = length(x0_stack)
-    nxi = nx / N
-    nu = length(U_stack[1])
-    nui = nu / N
+    # Extract constraints 
+    p_ul = constraints[1][1].lower
+    p_uu = constraints[1][1].upper
+    p_xl = constraints[1][2].lower
+    p_xu = constraints[1][2].upper
 
-    # Player Costs NOTE: hardcoded for 2 players atm
-    pursuer_cost = FunctionPlayerCost((g, x, u, t) -> (potentials[1] + log_barriers(constraints[1], ρ)))
-    evader_cost = FunctionPlayerCost((g, x, u, t) -> (potentials[2] + log_barriers(constraints[2], ρ)))
+    e_ul = constraints[2][1].lower
+    e_uu = constraints[2][1].upper
+    e_xl = constraints[2][2].lower
+    e_xu = constraints[2][2].upper
+     
+    # Player Costs
+    pursuer_cost = FunctionPlayerCost((g, x, u, t) -> norm(x[1:2] - x[4:5]) + potentials[1](x[1:2]) +
+    soft_log_barrier(u[1:2], p_ul, p_uu, ρ) + soft_log_barrier(x[1:3], p_xl, p_xu, ρ))
+    evader_cost = FunctionPlayerCost((g, x, u, t) -> -norm(x[1:2] - x[4:5]) + potentials[2](x[4:5]) +
+    soft_log_barrier(u[3:4], e_ul, e_uu, ρ) + soft_log_barrier(x[4:6], e_xl, e_xu, ρ))
     costs = Tuple([pursuer_cost, evader_cost])
+
 
     # Defining the game 
     player_inputs = (SVector(1, 2), SVector(3, 4))
     g = GeneralGame(T, player_inputs, dynamics, costs)
 
     # Type Conversion/Setup for Warm Starts 
-    init_traj = SystemTrajectory{dt}(X_stack, U_stack, t0)
-    γ0 = dummy_strategy(g)
+    # init_traj = SystemTrajectory{dt}(X_stack, U_stack, t0)
+    # γ0 = dummy_strategy(g)
 
     # Solve 
+    print("Solving...")
     solver = iLQSolver(g)
-    converged, trajectory, strategies = solve!(init_traj, γ0, g, solver, SVector{nx}(x0))
+    converged, trajectory, strategies = iLQGames.solve(g, solver, SVector{6}(x0_stack))
+    println("Complete. Convergence: ", converged)
+    # converged, trajectory, strategies = solve!(init_traj, γ0, g, solver, SVector{nx}(x0))
 
     return trajectory
 end 
